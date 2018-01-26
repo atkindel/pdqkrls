@@ -1,0 +1,384 @@
+---
+title: "KRLS 18 December"
+author: "Alex Kindel"
+date: "18 December 2017"
+output: pdf_document
+---
+
+```{r setup, echo=FALSE}
+require(foreach)
+require(dplyr)
+require(magrittr)
+require(ggplot2)
+require(reshape2)
+require(KRLS)
+require(rsvd)
+require(here)
+
+options(scipen=999)  # No scientific notation
+theme_set(theme_bw())
+```
+
+## Background
+
+Hainmueller & Hazlett (2013) propose kernel regularized least squares (hereafter KRLS) for modeling and inference in the social sciences. KRLS is advantageous for regression analysis because it is capable of learning complex interactions from data, reducing the risk of model misspecification. Despite its advantages, the closed-form KRLS estimator requires a matrix inversion step that scales in $O(N^3)$, making it intractable for large datasets. This is too bad, because we'd expect KRLS to perform well in settings with large amounts of data, where more information about complex interactions is discoverable in principle. We are exploring ways to scale up KRLS by developing an approximate estimator.
+
+### Our prior approaches: low-rank approximation over partitions
+
+We first tried using the HODLR matrix approximation (hierarchical off-diagonal low-rank), which scales in $O(N log N)$, but found that this only scales well to low-dimensional feature spaces -- see Ambikasaran et al. (2016). This approach may work if we can figure out a way to reduce the feature space in a less lossy way.
+
+We then tried learning a partition over the dataset to which fast approximations may be applied and aggregated. We approached this by performing recursive partitioning (borrowed from `party::ctree`) and random subspace selection to compute many random bootstrap subsamples of the dataset, which we then used to compute closed-form KRLS estimates (from `KRLS::krls`), generate predictions and compute average partial derivatives. At the leaf nodes, the dimensionality of the partition is usually significantly reduced (random subspace selection also contributes to this), so this may be combinable with HODLR. However, the closed-form marginal effect estimates are generally biased for covariates that are preferential splits in the partitioning step, which is problematic because these covariates are also typically highly interactive (which is, in some sense, the point of using KRLS).
+
+To overcome this we tried computing partitions using random subspace divide-and-conquer (following Zhang et al. 2015, *JMLR*). In general this did not seem to improve upon divide-and-conquer in a reasonable way, because achieving significant gains in time complexity requires prohibitively limiting the interactive complexity of the model.
+
+### Present approach: low-rank approximation as regularization
+
+Currently, we are evaluating an approach that uses a low-rank SVD approximation to the kernel matrix inverse to speed up two tasks: (1) computing KRLS point and interval estimates, and (2) estimating the regularization parameter $\lambda$. A low-rank approximation should speed up estimation due to the reduced size of the matrix of eigenvalues, and should speed up estimation of the regularization parameter by incorporating regularization into the choice of rank. However, this requires optimizing against both simultaneously. Fully optimizing for unbiased point estimates seems to blow up the shrinkage parameter computed by grid search cross-validation.
+
+### Updates
+
+```{r approx_krls}
+# Source modified KRLS package
+setwd("~/Code/qt-krls/eoq/")
+source("./surgery/krls.R")
+source("./surgery/gausskernel.R")
+source("./surgery/lambdasearch.r")
+source("./surgery/looloss.R")
+source("./surgery/multdiag.R")
+source("./surgery/solveforc.R")
+source("./surgery/zzz.R")
+source("./surgery/fdskrls.R")
+```
+
+Retry this with the H&H specification
+
+```{r test_battery}
+# Set seed and train-test sample sizes
+# Using 75-25 TT split
+set.seed(8675309)
+n_train <- 3000
+n_test <- 1000
+
+# Generate X
+#  x1, x2 ~ N(1, 1)
+#  x3, x4 ~ N(-1, 1)
+#  x5 ~ U(0.5)
+#  x6 ... x10 ~ N(0, 1)
+generate_X <- function(n_obs) {
+  norm_X <- replicate(10, rnorm(n_obs, 0, 1))
+  norm_X[,1:2] <- replicate(2, rnorm(n_obs, 1.0, 1))
+  norm_X[,3:4] <- replicate(2, rnorm(n_obs, -1.0, 1))
+  norm_X[,5] <- rbinom(n_obs, 1, 0.5)
+  norm_X <- apply(norm_X, 2, as.numeric)
+  return(norm_X)
+}
+X_train <- generate_X(n_train)
+X_test <- generate_X(n_test)
+
+# Specify interactive models
+y1 <- function(X) { X[,1] + X[,2] + X[,3] + X[,4] + X[,5] + X[,6] + X[,7] + X[,8] + X[,9] + X[,10] }  # Linear additive
+y2 <- function(X) { y1(X) + X[,6]*X[,7] }  # Single c-c ixn
+y3 <- function(X) { y1(X) + X[,5]*X[,8] }  # Single c-b ixn
+y4 <- function(X) { y1(X) + X[,6]*X[,7] + X[,8]*X[,9] }  # Two c-c ixns
+y5 <- function(X) { y1(X) + X[,5]*X[,8] + X[,6]*X[,9] }  # 1 c-b, 1 c-c
+y6 <- function(X) { y1(X) + X[,5]*X[,8] + X[,8]*X[,9] + X[,5]*X[,9] + X[,5]*X[,8]*X[,9] } # Full 3-way ixn
+y7 <- function(X) { X[,1] + X[,3] + X[,5] + X[,7] + X[,9] }  # Linear additive, omitting even covariates
+
+# Generate train sets
+y1_train <- y1(X_train)
+y2_train <- y2(X_train)
+y3_train <- y3(X_train)
+y4_train <- y4(X_train)
+y5_train <- y5(X_train)
+y6_train <- y6(X_train)
+y7_train <- y7(X_train)
+
+# Generate test sets
+y1_test <- y1(X_test)
+y2_test <- y2(X_test)
+y3_test <- y3(X_test)
+y4_test <- y4(X_test)
+y5_test <- y5(X_test)
+y6_test <- y6(X_test)
+y7_test <- y7(X_test)
+```
+
+### Test battery
+
+```{r test_setup}
+## Helper functions and test battery parameters
+ranks <- c(50, 200, 500, 1000)
+
+# Function to compute MSE of test set from given KRLS object
+compute_mse <- function(krlsobj, actual) {
+  fit <- predict(krlsobj, X_test)$fit
+  plot <- data.frame(predicted=fit, actual=actual) %>% ggplot(aes(x=actual, y=predicted)) + geom_point()
+  mse <- sum((actual - fit) ^ 2) / length(actual)
+  return(mse)
+} 
+```
+
+#### y1
+
+```{r y1_test}
+# y1
+krls50_y1 <- krls(X_train, y1_train, rank=50)
+krls200_y1 <- krls(X_train, y1_train, rank=200)
+krls500_y1 <- krls(X_train, y1_train, rank=500)
+krls1000_y1 <- krls(X_train, y1_train, rank=1000)
+krlsFull_y1 <- krls(X_train, y1_train)
+```
+
+```{r y1_plot}
+# Plot histogram of derivatives -- empirical mean should be 1 in all cases
+rbind.data.frame(cbind.data.frame(data.frame(melt(krls50_y1$derivatives)),rank="50"),
+                 cbind.data.frame(data.frame(melt(krls200_y1$derivatives)),rank="200"),
+                 cbind.data.frame(data.frame(melt(krls500_y1$derivatives)),rank="500"),
+                 cbind.data.frame(data.frame(melt(krls1000_y1$derivatives)),rank="1000"),
+                 cbind.data.frame(data.frame(melt(krlsFull_y1$derivatives)),rank="Full")) %>%
+  ggplot(aes(x=value, fill=rank)) +
+  geom_density(position="identity", alpha=0.3) +
+  facet_wrap(~Var2) +
+  geom_vline(aes(xintercept=1), linetype="dashed")
+```
+
+#### The rest
+
+```{r rest, eval=F}
+# y2
+krls50_y2 <- krls(X_train, y2_train, rank=50)
+krls200_y2 <- krls(X_train, y2_train, rank=200)
+krls500_y2 <- krls(X_train, y2_train, rank=500)
+krls1000_y2 <- krls(X_train, y2_train, rank=1000)
+krlsFull_y2 <- krls(X_train, y2_train)
+
+# y3
+krls50_y3 <- krls(X_train, y3_train, rank=50)
+krls200_y3 <- krls(X_train, y3_train, rank=200)
+krls500_y3 <- krls(X_train, y3_train, rank=500)
+krls1000_y3 <- krls(X_train, y3_train, rank=1000)
+krlsFull_y3 <- krls(X_train, y3_train)
+
+# y4
+krls50_y4 <- krls(X_train, y4_train, rank=50)
+krls200_y4 <- krls(X_train, y4_train, rank=200)
+krls500_y4 <- krls(X_train, y4_train, rank=500)
+krls1000_y4 <- krls(X_train, y4_train, rank=1000)
+krlsFull_y4 <- krls(X_train, y4_train)
+
+# y5
+krls50_y5 <- krls(X_train, y5_train, rank=50)
+krls200_y5 <- krls(X_train, y5_train, rank=200)
+krls500_y5 <- krls(X_train, y5_train, rank=500)
+krls1000_y5 <- krls(X_train, y5_train, rank=1000)
+krlsFull_y5 <- krls(X_train, y5_train)
+
+# y6
+krls50_y6 <- krls(X_train, y6_train, rank=50)
+krls200_y6 <- krls(X_train, y6_train, rank=200)
+krls500_y6 <- krls(X_train, y6_train, rank=500)
+krls1000_y6 <- krls(X_train, y6_train, rank=1000)
+krlsFull_y6 <- krls(X_train, y6_train)
+
+# y7
+krls50_y7 <- krls(X_train, y7_train, rank=50)
+krls200_y7 <- krls(X_train, y7_train, rank=200)
+krls500_y7 <- krls(X_train, y7_train, rank=500)
+krls1000_y7 <- krls(X_train, y7_train, rank=1000)
+krlsFull_y7 <- krls(X_train, y7_train)
+```
+
+### KRLS updates on GitHub
+
+Looking at: https://github.com/lukesonnet/KRLS/blob/master/R/kernels.R
+
+- Eigenvalue truncation is set as a parameter to krls() by proportion of variance explained by the eigendecomposition.
+    - This is a nice interface but it seems like our approach (choose rank) is better as long as we pick a good/principled default
+    - Eigendecomposition is performed using the implementation in RSpectra
+- Pointwise marginal effects computed in C++ -- nothing fancy here, they're just trying to compute this quickly
+- Kernel matrix is explicitly computed and stored.
+    - Would it be cheaper to only store the eigenvalues and eigenvectors of our chosen rank and recompute the kernel matrix from these on the fly when we need it? The short answer is, in general, yes. See below:
+    
+```{r full_kernel_complexity}
+# Time
+system.time(gausskernel(X_train[1:500,], sigma=10) -> K500) -> time500
+system.time(gausskernel(X_train[1:1000,], sigma=10) -> K1000) -> time1000
+system.time(gausskernel(X_train[1:1500,], sigma=10) -> K1500) -> time1500
+system.time(gausskernel(X_train[1:2000,], sigma=10) -> K2000) -> time2000
+system.time(gausskernel(X_train[1:2500,], sigma=10) -> K2500) -> time2500
+system.time(gausskernel(X_train, sigma=10) -> KFull) -> timeFull
+cbind.data.frame(time=c(time500[["elapsed"]], time1000[["elapsed"]], time1500[["elapsed"]],
+                        time2000[["elapsed"]], time2500[["elapsed"]], timeFull[["elapsed"]]),
+                 rank=c(500, 1000, 1500, 2000, 2500, 3000)) %>%
+  ggplot(aes(x=rank, y=time)) +
+  geom_point() +
+  labs(y="Time elapsed (s)", x="N", title="K computation time")
+
+# Space
+object.size(K500) -> space500
+object.size(K1000) -> space1000
+object.size(K1500) -> space1500
+object.size(K2000) -> space2000
+object.size(K2500) -> space2500
+object.size(KFull) -> spaceFull
+cbind.data.frame(memory=c(space500, space1000, space1500, space2000, space2500, spaceFull),
+                 rank=c(500, 1000, 1500, 2000, 2500, 3000)) %>%
+  ggplot(aes(x=rank, y=memory)) +
+  geom_point() +
+  labs(y="Memory usage (b)", x="N", title="K memory utilization")
+```
+
+```{r decomp_complexity}
+# Time eigendecomposition
+system.time(reigen(KFull, k=50) -> e50) -> time_e50
+system.time(reigen(KFull, k=100) -> e100) -> time_e100
+system.time(reigen(KFull, k=200) -> e200) -> time_e200
+system.time(reigen(KFull, k=500) -> e500) -> time_e500
+system.time(reigen(KFull, k=1000) -> e1000) -> time_e1000
+cbind.data.frame(time=c(time_e50[["elapsed"]], time_e100[["elapsed"]], time_e200[["elapsed"]],
+                        time_e500[["elapsed"]], time_e1000[["elapsed"]]),
+                 rank=c(50, 100, 200, 500, 1000)) %>%
+  ggplot(aes(x=rank, y=time)) +
+  geom_point() +
+  labs(y="Time elapsed (s)", x="Rank", title="Eigendecomposition time")
+
+# Time approximate kernel matrix recomputation
+# For very low-rank approximations, this computation is faster than computing the 
+# But, note that this needs to be done every time we use the kernel matrix, so expect to do this around d+5 times
+system.time(tcrossprod(multdiag(X=e50$vectors, d=e50$values), e50$vectors)) -> time_e50_k
+system.time(tcrossprod(multdiag(X=e100$vectors, d=e100$values), e100$vectors)) -> time_e100_k
+system.time(tcrossprod(multdiag(X=e200$vectors, d=e200$values), e200$vectors)) -> time_e200_k
+system.time(tcrossprod(multdiag(X=e500$vectors, d=e500$values), e500$vectors)) -> time_e500_k
+system.time(tcrossprod(multdiag(X=e1000$vectors, d=e1000$values), e1000$vectors)) -> time_e1000_k
+cbind.data.frame(time=c(time_e50_k[["elapsed"]], time_e100_k[["elapsed"]], time_e200_k[["elapsed"]],
+                        time_e500_k[["elapsed"]], time_e1000_k[["elapsed"]]),
+                 rank=c(50, 100, 200, 500, 1000)) %>%
+  ggplot(aes(x=rank, y=time)) +
+  geom_point() +
+  geom_hline(aes(yintercept=timeFull[["elapsed"]]), linetype="dashed") +
+  labs(y="Time elapsed (s)", x="Rank", title="Approximate K recomputation time")
+
+# Space utilization
+# This is where we take a lot of our space budget back -- even an inadvisably high value of k yields massive space savings
+object.size(e50) -> space_e50
+object.size(e100) -> space_e100
+object.size(e200) -> space_e200
+object.size(e500) -> space_e500
+object.size(e1000) -> space_e1000
+cbind.data.frame(memory=c(space_e50, space_e100, space_e200, space_e500, space_e1000),
+                 rank=c(50, 100, 200, 500, 1000)) %>%
+  ggplot(aes(x=rank, y=memory)) +
+  geom_point() +
+  geom_hline(aes(yintercept=as.numeric(spaceFull)), linetype="dashed") +
+  labs(y="Memory usage (b)", x="Rank", title="Eigendecomposition memory utilization")
+```
+
+### Lambda selection
+
+Upon further inspection, it looks like rsvd::reigen was returning squared eigenvalues (why??). Once this was fixed, I observed the following lambda curve at differing rank approximations (note that this pattern repeats in different specifications):
+ 
+```{r justforlambda}
+krls25_y1 <- krls(X_train, y1_train, derivative=F, vcov=F, rank=25)
+krls100_y1 <- krls(X_train, y1_train, derivative=F, vcov=F, rank=100)
+krls2000_y1 <- krls(X_train, y1_train, derivative=F, vcov=F, rank=2000)
+krls2250_y1 <- krls(X_train, y1_train, derivative=F, vcov=F, rank=2250)
+krls2300_y1 <- krls(X_train, y1_train, derivative=F, vcov=F, rank=2300)
+krls2350_y1 <- krls(X_train, y1_train, derivative=F, vcov=F, rank=2350)
+krls2380_y1 <- krls(X_train, y1_train, derivative=F, vcov=F, rank=2380)
+krls2400_y1 <- krls(X_train, y1_train, derivative=F, vcov=F, rank=2400)
+krls2500_y1 <- krls(X_train, y1_train, derivative=F, vcov=F, rank=2500)
+krls2999_y1 <- krls(X_train, y1_train, derivative=F, vcov=F, rank=2999)
+```
+
+```{r lambda_plots}
+# Plot lambda for each rank
+cbind.data.frame(lambda=c(krls25_y1$lambda, krls50_y1$lambda, krls100_y1$lambda, krls200_y1$lambda, krls500_y1$lambda,
+                          krls1000_y1$lambda, krls2000_y1$lambda, krls2250_y1$lambda, krls2300_y1$lambda, krls2350_y1$lambda,
+                          krls2380_y1$lambda, krls2400_y1$lambda, krls2500_y1$lambda, krls2999_y1$lambda, krlsFull_y1$lambda),
+                 rank=c(25, 50, 100, 200, 500, 1000, 2000, 2250, 2300, 2350, 2380, 2400, 2500, 2999, 3000)) %>%
+  ggplot(aes(x=rank, y=lambda)) + 
+  geom_point() +
+  labs(x="Rank", y="Lambda", title="Lambda estimate (argmin SS-LOOE) in low-rank approximation regime")
+```
+
+Do this but with root-SSE on the Y axis
+
+This seems to be an issue with the search algorithm for lambda -- it looks like the loss metric blows up with low-rank approximations. The loss metric is computed as:
+
+(Trace the search algorithm and watch what it does)
+
+$$
+\begin{aligned}
+\lambda_{LOOE} &= \underset{\lambda}{\arg\min} ||\frac{c(\lambda, k)}{diag(G(\lambda, k)^{-1})}||_2^2 \\
+& = \underset{\lambda}{\arg\min} ||\frac{G(\lambda, k)^{-1}y}{diag(G(\lambda, k)^{-1})}||_2^2
+\end{aligned}
+$$
+
+Note that both the numerator and denominator depend on lambda through $G^{-1}$. In the non-approximate case, the rank parameter k is equal to N (i.e. G is full-rank). Holding lambda and y constant, the error decreases monotonically in rank, and is quite high for very low rank approximations relative to the whole thing:
+
+(What are the numerator and denominator doing here?)
+(It could be that this estimator is just really bad -- run the rank 50 estimator with lots of different lambdas and compare the LOOE to the actual out of sample error, making sure the metrics are comparable. Also do this for the full rank case. Want to see if the LOOE works well at all ranks.)
+
+```{r lambda_err}
+# Function to compute sum of squared LOOEs
+lerr <- function(lambda, rank) {
+  rank <- as.character(rank)
+  # eo <- switch(rank,
+  #              "50"=e50,
+  #              "100"=e100,
+  #              "200"=e200,
+  #              "500"=e500,
+  #              "1000"=e1000,
+  #              "3000"=eFull)
+  #eo <- e50
+  eo <- e500
+  eo$values <- sqrt(eo$values)  # reigen returns squared eigenvalues
+  Ginv <- tcrossprod(multdiag(X=eo$vectors, d=1/(eo$values+lambda)), eo$vectors)
+  #return(sqrt(crossprod(tcrossprod(Ginv,t(y1_train))/diag(Ginv))))
+  return(sqrt(crossprod(tcrossprod(Ginv,t(y6_train))/diag(Ginv))))
+}
+vlerr <- Vectorize(lerr)
+l_try <- c(0.00001, 0.001, 0.1, 1, 10, 100, 10000)
+ranks <- c(50, 100, 200, 500, 1000, 3000)
+
+# LOOE estimates by rank
+approxs <- data.frame(expand.grid(l_try, ranks))
+looe_ests <- vlerr(approxs$Var1, approxs$Var2)
+looe_eo <- cbind.data.frame(approxs, looe_ests)
+looe_eo %>% ggplot(aes(x=Var1, y=looe_ests, color=as.factor(Var2))) +
+  geom_point() +
+  geom_path() +
+  scale_x_log10() + scale_y_log10() +
+  labs(x="Lambda", y="LOOE (root SSE)", color="Rank", title="LOOE estimate by lambda, rank")
+```
+
+Check that the pink line does dip below one (and hits some kind of minimum)
+
+It could be that the low-rank approximation is already over-regularizing, so we actually *should* have a really small lambda
+
+### Main thing to look at
+
+- Error in cross-validation to select lambda
+    - Try rank = #cols, no rank limit (these should be the same) -> #cols - 1 vs no rank limit (if not the same, then something weird is happening)
+    - Figured out the bug here: Filling in zeros to keep the matrices conformable leads to radical over-shrinkage
+    - Do this
+- RMarkdown of time issues
+    - What does the timing situation look like for the sticky parts for a lot of different data situations
+- Literature on low-rank approximations as regularization
+    - There must be a literature on this! Do we have a prior here on what low-rank approximations are doing
+- Approximating vcov
+    - In eigendecomposition, U and Ut are orthonormal -> cool speedup opportunities
+- Isotropic basis functions
+    - You could vary the bandwidth by parameter to allow importance of variables to change
+    - If we could bootstrap quickly, we could compute these
+- Multiple kernel learning
+    - Run down literature on this
+- HODLR covariate matrix approximation
+    - SVD down to ~4 eigen-columns and then treat those as covariates
+    - How to characterize the accuracy? Query random entries in the kernel matrix
+    - Can also try OOS MSE
+- Try running the current KRLS code on github and see how much faster it is
+    - Also look at bigKRLS and what they've done with pointwise derivatives
+    - Pete Mohanty has an updated working paper on this
+- Selection search optimization on the rank parameter?
+
